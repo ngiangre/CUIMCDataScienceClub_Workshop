@@ -1,0 +1,289 @@
+---
+title: "Explaining GAMs"
+author: "Nick Giangreco"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#install.packages("pacman")
+pacman::p_load(data.table,tidyverse,knitr,splines,ggfortify,mgcv)
+
+theme_set(theme_bw(base_size = 16) + theme(text = element_text(face="bold")))
+```
+
+# Punchline 
+
+GAM > GLM > Logistic Regression for understanding nonlinear relationships. 
+
+# Introduction
+
+Oftentimes we want to model the relationship between a characteristic and an outcome. In my work, I want to evaluate the characteristic's relationship to the outcome in a way that doesn't bias the type of relationship it naturally has. In this tutorial, I will show how generalized additive models are a flexible yet interpretable way to model relationships in a population and have advantages over traditionally used methods. 
+
+# Outline
+
+* Question
+
+    - Setup the question to be investigated.
+   
+* Data
+
+    - Display the data to be used to answer the question
+
+* Relationship between outcome and characteristic
+
+    - Show different ways of visualizing the data as well as the relationship between the outcome and characteristic.
+   
+* Modeling
+
+    - Different modeling strategies to investigate the relationship. Each strategy or method will be generally explained with examples. 
+    
+    + Logistic Regression
+
+    + Regression Spline
+
+    + Generalized Additive Model
+    
+    
+# Data
+
+```{r data_setup, eval=F,echo=F}
+
+dat <- fread("../data/pediatric_patient_ADEs_atc5th_meddrapt_rinfo_dbid_chid.csv")
+
+report_dat <- 
+    dat[,.(safetyreportid,reporter_qualification,sex,age,nichd,weight,receive_date)] %>% 
+    unique()
+
+report_dat$D = as.integer(report_dat$safetyreportid %in% dat[atc_concept_id==21604757,safetyreportid,])
+report_dat$E = as.integer(report_dat$safetyreportid %in% dat[meddra_concept_id==36919075,safetyreportid])
+
+report_dat %>% 
+    fwrite("../data/drug_adverse_event_fda_drug_event_reports.csv")
+
+```
+
+```{r data}
+
+report_dat <- 
+    fread("../data/drug_adverse_event_fda_drug_event_reports.csv") %>% 
+    .[order(age)]
+
+report_dat[1:5] %>% 
+    kable("simple")
+
+```
+
+# Relationship between Paranoia and report characteristics
+
+```{r relationships}
+
+tab <- report_dat[,table(D,E)]
+prr <- (tab["1","1"] / ( tab["1","1"] + tab["1","0"] ) ) / (tab["0","1"] / (tab["0","1"] + tab["0","0"]) )
+prr
+
+report_dat[E==1,.N,.(D,age)] %>% 
+    ggplot(aes(age,N)) +
+    geom_point() +
+    facet_grid(D~.) +
+    ylab("Number of reports with the event") +
+    xlab("Age")
+
+report_dat[E==1,.(N = .N),.(D,reporter_qualification)] %>% 
+    ggplot(aes(N,reporter_qualification,fill=factor(D))) +
+    geom_bar(stat="identity",position="dodge") +
+    guides(fill=guide_legend(title="D")) +
+    xlab("Number of reports with the event") +
+    ylab("")
+
+report_dat[E==1,.(N = .N),.(D,sex)] %>% 
+    ggplot(aes(N,sex,fill=factor(D))) +
+    geom_bar(stat="identity",position="dodge") +
+    guides(fill=guide_legend(title="D")) +
+    xlab("Number of reports with the event") +
+    ylab("")
+
+report_dat[E==1,.N,.(D,weight)] %>% 
+    ggplot(aes(weight,N)) +
+    geom_point() +
+    scale_y_continuous(trans="log10") +
+    facet_grid(D~.) +
+    ylab("Number of reports with the event") +
+    xlab("Weight")
+
+```
+
+# Modeling
+
+## Logistic Regression
+
+```{r logit}
+
+glm_coef <- function(form="E ~ D - 1",id="id"){
+    formula=as.formula(form)
+    mod <- glm(formula,data=report_dat,family=binomial(link="logit"))
+    summ <- summary(mod)
+    dt <- summ$coefficients %>% data.table()
+    dt$formula <- form
+    dt$term <- summ$coefficients %>% rownames()
+    dt$id=id
+    dt
+}
+
+glm_coefs <- 
+    bind_rows(
+        glm_coef("E ~ D",id='model1'),
+        glm_coef("E ~ age",id='model2'),
+        glm_coef("E ~ D + age",id='model3')
+        )
+
+glm_coefs %>% 
+    ggplot(aes(formula,Estimate,color=term,group=term)) +
+    geom_point() +
+    geom_line()
+
+age_coef <- glm_coef("E ~ age",id='model2')[term=="age",Estimate]
+age_coef2 <- glm_coef("E ~ age + D",id='model2')[term=="age",Estimate]
+
+data.table(Age = seq(0,21,1),`E ~ age` = age_coef*seq(0,21,1),`E ~ age + D` = age_coef2*seq(0,21,1)) %>% 
+    pivot_longer(cols=c("E ~ age","E ~ age + D")) %>% 
+    ggplot(aes(Age,value,color=name)) +
+    geom_point() +
+    geom_line() +
+    guides(color=guide_legend(title="Model formula")) +
+    xlab("Age") +
+    ylab("Risk of Paranoia")
+
+```
+
+## Polynomial Regression
+
+`r age_grid <- seq(0,21)`
+
+```{r poly}
+# http://www.science.smith.edu/~jcrouser/SDS293/labs/lab12-r.html
+fit_plot_polynomial <- function(degree=3){
+    fit = glm(E ~ poly(age, degree), data = report_dat)
+    preds = predict(fit, newdata = list(age = age_grid), se = TRUE)
+    pfit = exp(preds$fit) / (1+exp(preds$fit))
+    se_bands_logit = cbind("upper" = preds$fit+2*preds$se.fit, 
+                           "lower" = preds$fit-2*preds$se.fit)
+    se_bands = exp(se_bands_logit) / (1+exp(se_bands_logit))
+    
+    E = report_dat[E==1]
+    
+    notE = report_dat[E==0]
+    
+    coefs = sapply(coef(fit)[2:(degree+1)],function(x){round(x,2)})
+    formula = 
+        paste0("E ~ ",paste0(sapply(1:degree,function(x){paste0(coefs[x]," * age^",x)}),collapse=" + "))
+    
+    ggplot() +
+      geom_rug(data = notE, aes(x = jitter(age), y = max(pfit)), sides = "b", alpha = 0.1) +
+      geom_rug(data = E, aes(x = jitter(age), y = min(pfit)), sides = "t", alpha = 0.1) +
+      geom_line(aes(x = age_grid, y = pfit), color = "#0000FF") +
+      geom_ribbon(aes(x = age_grid, 
+                      ymin = se_bands[,"lower"], 
+                      ymax = se_bands[,"upper"]), 
+                  alpha = 0.3) +
+      labs(title = paste0(formula,"\nAIC=",round(fit$aic,0)),
+           x = "Age",
+           y = "P(E)")
+}
+
+fit_plot_polynomial(1)
+fit_plot_polynomial(2)
+fit_plot_polynomial(3)
+fit_plot_polynomial(4)
+
+```
+
+## Regression splines
+
+```{r splines_broken}
+
+# Simon Wood's Intro to GAMs textbook chapter 4
+
+tf <- function(x,xj,j){
+    ## generate the jth tent function from set defined by knots xj
+    dj <- xj*0;dj[j] <- 1
+    ## linearly interpolates between xj and dj taking place at x
+    approx(xj,dj,x)$y
+}
+
+tf.X <- function(x,xj){
+    ## tent function basis matrix given data X
+    ## and knot sequence xk
+    nk <- length(xj); n <- length(x)
+    X <- matrix(NA,n,nk)
+    for(j in 1:nk) X[,j] <- tf(x,xj,j)
+    X
+}
+
+knots = c(0,1,2,6,11,17,19)
+Xp <- tf.X(age_grid,knots)
+
+Xp_dt = data.table(Xp)
+colnames(Xp_dt) <- knots %>% as.character()
+Xp_dt$age <- age_grid
+Xp_dt_melt <- 
+    Xp_dt %>% 
+    melt(id.vars="age",
+         variable.name="knot")
+
+Xp_dt_melt %>% 
+    ggplot(aes(age,value,color=knot)) +
+    geom_point() +
+    geom_line() +
+    facet_grid(knot~.)
+```
+
+
+```{r splines}
+# https://stats.stackexchange.com/questions/29345/visualizing-a-spline-basis/29346
+x <- report_dat$age
+spl <- ns(x,knots=knots)
+
+#sapply(1:ncol(spl),function(i){plot(x,spl[,i],ylab=paste0("Basis ",i),xlab="Age")})
+
+autoplot(spl)
+
+```
+
+## Generalized additive models
+
+<!-- https://rdrr.io/cran/mgcv/man/smooth.terms.html --->
+
+```{r glm_splines}
+
+mod = mgcv::bam(E ~ s(age) + D,
+                data=report_dat,
+                family=binomial(link="logit"),
+                method = "fREML")
+
+mod 
+
+plot(mod)
+
+mod = mgcv::bam(E ~ s(age,bs="cs") + D,
+                data=report_dat,
+                family=binomial(link="logit"),
+                method = "fREML")
+
+mod
+
+plot(mod)
+
+mod = mgcv::bam(E ~ s(age,bs="ps") + D,
+                data=report_dat,
+                family=binomial(link="logit"),
+                method = "fREML")
+
+mod
+
+plot(mod)
+
+```
+

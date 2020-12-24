@@ -8,6 +8,13 @@
 # User-specific files
 .Ruserdata
 
+#MAC
+.DS_Store
+
+# data
+pediatric_patient_ADEs_atc5th_meddrapt_rinfo_dbid_chid.csv
+
+
 # Example code in package build process
 *-Ex.R
 
